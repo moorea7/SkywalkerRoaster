@@ -124,6 +124,12 @@ Artisan configuration presets (`.aset` files) are in `ArtisanConfigs/`. Import t
 
 ## Development Workflow
 
+### Git Branching and PRs
+- **One concern per PR** — each pull request must be atomic (a single feature, fix, or doc change)
+- **Branch from `main`** — always create a fresh branch off `main` for each piece of work
+- **Branches are deleted after merge** — never reuse or build on a branch that has been merged; always start a new one from the updated `main`
+- **Branch naming:** use descriptive slugs, e.g. `feature/esp32-websocket`, `fix/checksum-overflow`, `docs/update-wiring`
+
 ### Building / Compiling
 There is no Makefile or build script. Compile sketches using the **Arduino IDE** directly.
 
