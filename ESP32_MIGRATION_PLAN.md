@@ -39,18 +39,62 @@ The dual-core split is essential: Core 1 runs the timing-sensitive roaster bit-b
 
 ## Hardware Changes
 
-### New hardware required
-- **ESP32 development board** (ESP32-WROOM-32 or equivalent)
-- **3.3V ↔ 5V level shifter** (bidirectional, e.g. TXS0102 or BSS138-based)
-  - Required because ESP32 GPIO is 3.3V; the roaster interface operates at 5V
+The current solution (ELEGOO Nano, ATmega328P) operates at **5V logic**. The ESP32 operates at **3.3V logic**. Each signal line is unidirectional, so each requires a different level-shifting technique.
 
-### Wiring changes
-| Signal | Arduino pin | ESP32 GPIO | Notes |
-|--------|-------------|------------|-------|
-| Roaster RX (read) | Digital 2 | GPIO 4 (or any input-capable) | Via level shifter |
-| Roaster TX (write) | Digital 3 | GPIO 5 (or any output-capable) | Via level shifter |
-| Power | VIN (5V) | VIN or separate 5V rail | ESP32 has onboard 3.3V reg |
-| Ground | GND | GND | Common ground with level shifter |
+### Bill of Materials
+
+| Qty | Component | Purpose | Notes |
+|-----|-----------|---------|-------|
+| 1 | ESP32-WROOM-32 dev board | Microcontroller | ESP32 DevKitC or equivalent |
+| 1 | 74HCT1G125 single buffer (SOT-23-5) | 3.3V → 5V on TX line | HCT family: accepts 3.3V in, outputs 5V; non-inverting; ~$0.30 |
+| 1 | 1 kΩ resistor (1/4W) | Voltage divider on RX line | |
+| 1 | 2 kΩ resistor (1/4W) | Voltage divider on RX line | |
+| 1 | 100 nF ceramic capacitor | Bypass cap for 74HCT VCC | Place close to IC pins |
+| — | Hookup wire / breadboard | Connections | |
+
+**Why these components:**
+- **74HCT1G125** — HCT-family logic accepts 3.3V as a valid HIGH (V_IH min = 2.0V) and outputs at VCC (5V). Non-inverting with active-low output enable tied to GND. Cleanest solution for boosting the TX line.
+- **Resistor divider (1kΩ + 2kΩ)** — Passively divides 5V to 3.33V on the RX line. No active components needed for a signal going *into* the ESP32. The signal source impedance of the roaster is low, so divider loading is not a concern.
+
+### Wiring diagram
+
+```
+ROASTER USB CABLE
+─────────────────────────────────────────────────────────────
+
+  Red  ──────────────────────── 5V rail ──┬── 74HCT1G125 VCC (pin 5)
+                                          └── 100nF cap ── GND
+
+  Black ─────────────────────── GND ─────┬── ESP32 GND
+                                         └── 74HCT1G125 GND (pin 2)
+
+  Green (Roaster → Arduino rxPin)
+    ├── R1 (1kΩ) ──┬── R2 (2kΩ) ── GND
+                   └──────────────────── ESP32 GPIO 4 (RX, 3.3V input)
+
+    [5V signal divided to 3.33V before reaching ESP32]
+
+  White (Arduino txPin → Roaster)
+    └── 74HCT1G125 output (pin 4) ──────── White wire onward to roaster
+
+         74HCT1G125 (SOT-23-5)
+         ┌─────────┐
+         │ /OE (2) ├── GND  (always enabled)
+         │  A  (3) ├── ESP32 GPIO 5 (TX, 3.3V output)
+         │  Y  (4) ├── White wire → roaster (5V)
+         │ VCC (5) ├── 5V rail
+         │ GND (1) ├── GND
+         └─────────┘
+```
+
+### Wiring table
+
+| Signal | Arduino pin | ESP32 GPIO | Level shifting |
+|--------|-------------|------------|----------------|
+| Roaster RX / read (Green wire) | Digital 2 | GPIO 4 | 5V → 3.3V via 1kΩ + 2kΩ divider |
+| Roaster TX / write (White wire) | Digital 3 | GPIO 5 | 3.3V → 5V via 74HCT1G125 |
+| Power (Red wire) | VIN | VIN | Direct — also powers 74HCT1G125 |
+| Ground (Black wire) | GND | GND | Common ground |
 
 GPIO numbers are suggestions — any available GPIO works with RMT.
 
