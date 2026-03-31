@@ -144,85 +144,160 @@ Artisan commands to support (same as current TC4 set):
 
 ---
 
+## Safety Principle
+
+**Never transmit to the roaster without a verified, working temperature read-back.**
+
+The over-temperature cutoff (300°C) and all safety logic depend entirely on the RX path being correct. A broken or unvalidated RX path silently disables the primary protection while the roaster is live. Equally, a TX bug could send a garbage heat command with no way to detect it. For these reasons:
+
+- All read logic is built and validated before any write logic
+- Write capability is introduced one output at a time, in order of increasing hazard
+- The heat/burner output is enabled last, only after every other output and all safety paths are confirmed working
+
+---
+
 ## Migration Phases
 
-### Phase 1 — WebSocket server (Artisan connection)
+### Phase 1 — RMT RX: passive read (Spy mode)
 
-**Scope:** Establish the WebSocket link between Artisan and the ESP32. No real roaster protocol yet — use stub temperature values.
+**Scope:** Port `SkywalkerSpy` to ESP32 using RMT. Receive-only — no transmission to the roaster at any point in this phase.
+
+This is the safest possible starting point. The ESP32 only listens; the existing Nano can remain connected in parallel as a ground truth reference.
 
 **Tasks:**
-1. Create new sketch `SkyCommandESP32/SkyCommandESP32.ino`
+1. Create `SkywalkerSpyESP32/SkywalkerSpyESP32.ino`
+2. Configure RMT RX channel on the roaster read GPIO
+3. Set RMT filter threshold to reject glitches < 400 µs
+4. Set RMT idle threshold to ~9000 µs (end-of-message marker)
+5. Decode captured `rmt_item32_t[]` array: `duration0 > 1200 µs` → bit `1`, else bit `0`
+6. Reconstruct bytes LSB-first; detect preamble item (`duration0 > 5000 µs`) for frame alignment
+7. Validate checksum on every frame
+8. Apply existing temperature polynomial to decoded ADC values A and B
+9. Output `TEMP,HEAT_DUTY,VENT_DUTY` over USB serial
+
+**Validation:** Run ESP32 and existing Nano side-by-side. Compare temperature readings across a full heat cycle. Values must agree within 1°C before proceeding.
+
+**Success criteria:** ESP32 temperature readings match the known-good Nano over USB serial, validated across a real heat cycle.
+
+---
+
+### Phase 2 — WebSocket server (Artisan connection, read-only)
+
+**Scope:** Add WiFi and WebSocket transport. Artisan connects and receives live temperature — still no TX to the roaster.
+
+**Tasks:**
+1. Create `SkyCommandESP32/SkyCommandESP32.ino` based on the Spy sketch
 2. Connect ESP32 to WiFi (hardcoded SSID/password initially)
 3. Start a `WebSocketsServer` on port 81 using the `arduinoWebSockets` library
-4. Implement a `webSocketEvent()` callback that parses incoming text frames and dispatches commands
-5. On `READ`, respond with stub values (e.g. `"20.0,20.0"`)
-6. On control commands (`OT1`, `OT2`, etc.), store the value and respond `"#OK"`
-7. Configure Artisan's WebSocket device to point at the ESP32 IP and verify the connection
+4. Implement `webSocketEvent()` callback: respond to `READ` with real temperature values from Phase 1
+5. Reject all control commands (`OT1`, `OT2`, `DRUM`, `COOL`, `OFF`, `ESTOP`) with `#READONLY` — do not act on them
+6. Configure Artisan WebSocket device: Config → Device → WebSocket → `ws://<esp32-ip>:81`
 
 **Library:** `arduinoWebSockets` by Markus Sattler — available via Arduino Library Manager as `WebSockets`.
 
-**Artisan configuration:**  
-Config → Device → set device to **WebSocket** → enter `ws://<esp32-ip>:81` → map ET/BT to the two values in the `READ` response.
-
-**Success criteria:** Artisan connects over WiFi, polls `READ` on schedule, and receives stub temperature values without errors.
+**Success criteria:** Artisan displays live roaster temperature over WiFi. Control commands are received but explicitly rejected.
 
 ---
 
-### Phase 2 — RMT TX (send commands to roaster)
+### Phase 3 — Dual-core task split
 
-**Scope:** Replace `pulsePin()` / `sendRoasterMessage()` with RMT-based pulse generation.
+**Scope:** Move the roaster RX loop to Core 1 before introducing any TX. This isolates timing-sensitive RX from WiFi ISR activity and is the correct foundation for all subsequent write phases.
 
 **Tasks:**
-1. Configure an RMT TX channel on the roaster write GPIO
-2. Build a helper `buildRmtFrame(uint8_t* bytes, size_t len)` that converts the 6-byte roaster message into an `rmt_item32_t[]` pulse sequence using the known timing constants
-3. Replace the `sendRoasterMessage()` function body with an RMT transmit call
-4. Validate output with a logic analyzer against the known protocol timing
+1. Extract the roaster read loop into a FreeRTOS task `roasterTask(void* params)`
+2. Pin to Core 1: `xTaskCreatePinnedToCore(roasterTask, "roaster", 4096, NULL, 2, NULL, 1)`
+3. Share temperature state to Core 0 via mutex-protected struct
+4. Keep WiFi, WebSocket server, and Artisan handling on Core 0
+5. Validate temperature readings remain stable under active WebSocket traffic
+6. Validate the 10-second failsafe watchdog still triggers correctly across cores
 
-**Key implementation note:**  
-Each byte is sent LSB-first. Each bit becomes an `rmt_item32_t` with `duration0` set to the pulse length (1500 or 650 µs) and `duration1` set to the inter-bit gap (750 µs). The preamble is a single long item (7500 µs low, 3800 µs high).
-
-**Success criteria:** Logic analyzer confirms correct pulse widths and byte values for a known command.
+**Success criteria:** No temperature read degradation during sustained WebSocket traffic. Failsafe confirmed working.
 
 ---
 
-### Phase 3 — RMT RX (receive temperature from roaster)
+### Phase 4 — RMT TX: shutdown and emergency stop
 
-**Scope:** Replace `receiveSerialBitsFromRoaster()` / `pulseIn()` with RMT-based pulse capture.
-
-This is the most complex phase.
+**Scope:** Introduce the first write path — commands that put the roaster into a safe state. These are the lowest-risk outputs: they reduce heat and stop operation.
 
 **Tasks:**
-1. Configure an RMT RX channel on the roaster read GPIO
-2. Set the RMT filter threshold to reject glitches < 400 µs
-3. Set the RMT idle threshold to ~9000 µs (end-of-message marker)
-4. In the receive loop, read the captured `rmt_item32_t[]` array
-5. Decode each item: `duration0 > 1200 µs` → bit `1`, else bit `0` (same threshold as current code)
-6. Reconstruct bytes LSB-first
-7. Detect the preamble item (`duration0 > 5000 µs`) to align frame boundaries
-8. Validate checksum; on failure increment `roasterReadAttempts` as before
-9. Feed decoded ADC values A and B into the existing temperature polynomial calculation
-10. Replace the stub `READ` response with real temperature values
+1. Configure RMT TX channel on the roaster write GPIO
+2. Implement `buildRmtFrame(uint8_t* bytes, size_t len)` — converts 6-byte message to `rmt_item32_t[]` pulse sequence (LSB-first; preamble 7500 µs low / 3800 µs high; bit `1` = 1500 µs, bit `0` = 650 µs, inter-bit gap 750 µs)
+3. Implement `OFF` command: transmit all-zero duty cycles (heat=0, fan=0, drum=0)
+4. Implement `ESTOP` command: same as OFF but set internal eStop flag to block further commands
+5. Validate both commands on a logic analyzer before connecting to roaster
+6. Connect to roaster and verify `OFF` produces correct shutdown behaviour
+7. Remove `#READONLY` rejection for `OFF` and `ESTOP` in the WebSocket handler
 
-**Success criteria:** Live temperature readings from the roaster displayed correctly in Artisan over WebSocket.
+**Success criteria:** `OFF` and `ESTOP` commands transmitted correctly; roaster shuts down cleanly on receipt.
 
 ---
 
-### Phase 4 — Dual-core task split
+### Phase 5 — RMT TX: bean cooler
 
-**Scope:** Move the roaster protocol loop to Core 1 to fully isolate it from WiFi and WebSocket activity.
+**Scope:** Enable the `COOL` command (cooling fan output). This is safe to enable early — activating the cooler cannot raise temperature.
 
 **Tasks:**
-1. Extract the roaster read/write loop into a FreeRTOS task function `roasterTask(void* params)`
-2. Pin it to Core 1: `xTaskCreatePinnedToCore(roasterTask, "roaster", 4096, NULL, 2, NULL, 1)`
-3. Share state between cores using a mutex-protected struct (current temps, pending commands)
-4. Keep WiFi, WebSocket server, and Artisan command handling on Core 0 (the default Arduino `loop()`)
-5. Validate that the failsafe watchdog (10-second timeout) still functions correctly across cores
+1. Implement `COOL` command: set cool fan byte in the 6-byte message; all other outputs remain at last safe values
+2. Validate on logic analyzer
+3. Test on roaster: confirm cooling fan activates and temperature is tracked correctly throughout
+4. Remove `#READONLY` rejection for `COOL`
 
-**Success criteria:** No timing degradation in roaster communication during active WebSocket data transfer.
+**Success criteria:** Cooling fan activates on `COOL` command; temperature continues to read correctly.
 
 ---
 
-### Phase 5 — WiFi provisioning
+### Phase 6 — RMT TX: drum
+
+**Scope:** Enable the `DRUM` command (drum motor output).
+
+**Tasks:**
+1. Implement `DRUM` command: set drum byte in the 6-byte message
+2. Validate on logic analyzer
+3. Test on roaster: confirm drum starts/stops correctly; confirm no interference with temperature readings
+4. Remove `#READONLY` rejection for `DRUM`
+
+**Success criteria:** Drum motor responds correctly to `DRUM` commands at all specified speeds.
+
+---
+
+### Phase 7 — RMT TX: air / vent
+
+**Scope:** Enable the `OT2` command (vent/air fan output). Air affects roast dynamics but cannot directly cause overheating.
+
+**Tasks:**
+1. Implement `OT2` command: set vent duty byte in the 6-byte message (0–100)
+2. Validate on logic analyzer
+3. Test on roaster: confirm air fan responds proportionally; verify temperature readings remain stable across fan speeds
+4. Remove `#READONLY` rejection for `OT2`
+
+**Success criteria:** Vent fan responds correctly across the full 0–100 duty cycle range.
+
+---
+
+### Phase 8 — RMT TX: heat / burner
+
+**Scope:** Enable the `OT1` command (heat/burner output). This is the highest-risk output and is enabled last, only after all read paths, safety logic, and every other output have been individually validated.
+
+**Pre-conditions — all must be met before starting this phase:**
+- Temperature readings verified accurate across full roast range (Phase 1–3)
+- Over-temperature cutoff (300°C) confirmed functional via a controlled test
+- Failsafe timeout confirmed functional (disconnect Artisan; roaster must shut down within 10 seconds)
+- `OFF` and `ESTOP` confirmed working (Phase 4)
+- Cooling fan confirmed working (Phase 5)
+
+**Tasks:**
+1. Implement `OT1` command: set heat duty byte in the 6-byte message (0–100)
+2. Validate on logic analyzer at several duty values (0, 25, 50, 75, 100)
+3. Initial live test: start at low duty (e.g. 20%), confirm temperature rises proportionally, confirm `OFF` stops heating immediately
+4. Test over-temperature cutoff: raise heat until 300°C limit; confirm emergency stop fires
+5. Test 10-second failsafe under heat: kill WebSocket connection mid-roast; confirm roaster shuts down
+6. Remove `#READONLY` rejection for `OT1`
+
+**Success criteria:** Heat output responds correctly; over-temperature cutoff and failsafe both confirmed under real heat load.
+
+---
+
+### Phase 9 — WiFi provisioning
 
 **Scope:** Replace hardcoded SSID/password with a runtime configuration mechanism.
 
@@ -242,21 +317,7 @@ This is the most complex phase.
 
 ---
 
-### Phase 6 — Spy sketch port
-
-**Scope:** Port `SkywalkerSpy` to ESP32 for passive logging over WebSocket.
-
-**Tasks:**
-1. Create `SkywalkerSpyESP32/SkywalkerSpyESP32.ino`
-2. Apply the same RMT RX approach from Phase 3 to both controller and roaster Tx lines
-3. Replace blocking `pulseIn()` (currently has no timeout — will deadlock on ESP32) with RMT capture
-4. Stream `TEMP,HEAT_DUTY,VENT_DUTY` responses over WebSocket instead of USB serial
-
-**Success criteria:** Artisan receives passive temperature + duty cycle log over WebSocket.
-
----
-
-### Phase 7 — CI/CD and housekeeping
+### Phase 10 — CI/CD and housekeeping
 
 **Tasks:**
 1. Add ESP32 board to the GitHub Actions compile matrix:
@@ -274,12 +335,15 @@ This is the most complex phase.
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| RMT RX frame alignment issues (missed preamble) | Medium | High | Add idle-gap detection; test with logic analyzer before Artisan integration |
+| RMT RX frame alignment issues (missed preamble) | Medium | High | Add idle-gap detection; validate against Nano readings before any TX phase |
+| RX path silently fails during a roast | Low | High | Watchdog on RX: if no valid frame received in 2 seconds, trigger ESTOP |
+| RMT TX sends incorrect heat duty | Low | High | Logic analyzer validation required before connecting to roaster |
+| Over-temp cutoff non-functional if RX is broken | Medium | High | Explicitly test cutoff under real heat load in Phase 8 pre-conditions |
 | WebSocket reconnect causes Artisan dropout | Low | Medium | ESP32 WebSocket library handles reconnects; Artisan timeout is configurable |
 | Roaster failsafe triggers during WiFi reconnect | Medium | Medium | Cache last valid command; retransmit on reconnect; Core 1 continues independently |
-| Level shifter introduces signal delay | Low | Medium | Use fast level shifter (TXS0102); validate with logic analyzer |
+| Level shifter introduces signal delay | Low | Medium | Validate with logic analyzer in Phase 1 before any live roaster connection |
 | RMT timing drift at temperature | Low | Low | Timing constants have wide margins; monitor in field |
-| Artisan WebSocket message framing mismatch | Low | Medium | Test command/response format against Artisan WebSocket device docs before Phase 3 |
+| Artisan WebSocket message framing mismatch | Low | Medium | Test command/response format in Phase 2 before any TX is enabled |
 
 ---
 
@@ -309,16 +373,19 @@ The following are direct ports with no logic changes required:
 
 ---
 
-## Recommended Development Order
+## Development Order Summary
 
 ```
-Phase 1 (WebSocket + Artisan)  →  verify Artisan WiFi connection works
-Phase 2 (RMT TX)               →  verify roaster receives correct commands
-Phase 3 (RMT RX)               →  verify temperature reads correctly
-Phase 4 (dual-core)            →  stress test timing under WiFi load
-Phase 5 (provisioning)         →  quality-of-life, do last
-Phase 6 (Spy port)             →  independent, can be done any time after Phase 3
-Phase 7 (CI/CD)                →  done alongside each phase
+Phase 1  (RMT RX, Spy mode)       →  validate reads against Nano before anything else
+Phase 2  (WebSocket, read-only)    →  Artisan sees live temp; all control commands rejected
+Phase 3  (Dual-core split)         →  isolate RX from WiFi; confirm failsafe across cores
+Phase 4  (TX: shutdown / ESTOP)    →  first writes; safe-state commands only
+Phase 5  (TX: bean cooler)         →  cooling fan; cannot raise temperature
+Phase 6  (TX: drum)                →  drum motor; no thermal risk
+Phase 7  (TX: air / vent)          →  airflow control; no direct heat risk
+Phase 8  (TX: heat / burner)       →  last; all safety paths confirmed before enabling
+Phase 9  (WiFi provisioning)       →  quality-of-life; do last
+Phase 10 (CI/CD)                   →  done incrementally alongside each phase
 ```
 
-Each phase produces a testable, standalone result. Do not proceed to the next phase until the current one is validated against the real roaster hardware.
+**Do not proceed to the next phase until the current one is validated against real roaster hardware.**
