@@ -1,8 +1,19 @@
-# ESP32 Migration Plan — Serial over WiFi
+# ESP32 Migration Plan — WebSocket over WiFi
 
 ## Goal
 
-Replace the Arduino microcontroller with an ESP32, enabling Artisan Scope to connect wirelessly over TCP (WiFi serial) instead of USB, while preserving all existing roaster control and monitoring functionality.
+Replace the Arduino microcontroller with an ESP32, enabling Artisan Scope to connect wirelessly over WebSocket instead of USB, while preserving all existing roaster control and monitoring functionality.
+
+---
+
+## Why WebSocket (not raw TCP)
+
+Artisan does not support raw TCP serial connections. Its native network protocols are **MODBUS TCP**, **WebSocket**, and **Phidgets Network Server**. WebSocket is the best fit here:
+
+- Artisan has a dedicated WebSocket device type with configurable command/response mappings
+- The ESP32 Arduino ecosystem has a mature WebSocket server library (`arduinoWebSockets`)
+- No intermediate bridge process needed on the PC
+- Commands and responses are text-based — maps naturally to the existing TC4-style interface
 
 ---
 
@@ -11,10 +22,10 @@ Replace the Arduino microcontroller with an ESP32, enabling Artisan Scope to con
 ```
 Artisan (PC)
     │
-    │  TCP socket (WiFi, e.g. port 23)
+    │  WebSocket (ws://esp32-ip:81)
     ▼
 ESP32
-  ├── Core 0: WiFi stack + TCP server + Artisan TC4 command handling
+  ├── Core 0: WiFi stack + WebSocket server + Artisan command handling
   └── Core 1: Roaster protocol loop (RMT TX/RX, temp calc, failsafe)
         │
         │  GPIO pins (with 3.3V → 5V level shifter)
@@ -22,7 +33,7 @@ ESP32
     Roaster hardware (Skywalker/ITOP MTCR)
 ```
 
-The dual-core split is essential: Core 1 runs the timing-sensitive roaster bit-bang work in isolation from WiFi ISR activity on Core 0.
+The dual-core split is essential: Core 1 runs the timing-sensitive roaster bit-bang work in isolation from WiFi and WebSocket ISR activity on Core 0.
 
 ---
 
@@ -64,25 +75,52 @@ These constants are preserved unchanged — only the mechanism for generating/me
 
 ---
 
+## Artisan WebSocket Device Configuration
+
+Artisan's WebSocket device type (Config → Device → WebSocket) requires:
+
+- **URL:** `ws://<esp32-ip>:81`
+- **Command to request data:** e.g. `READ`
+- **Response format:** Artisan parses the response string for ET and BT values
+
+The ESP32 WebSocket server receives text frames from Artisan, processes the command, and sends back a text frame response — the same request/response pattern as the existing TC4 serial protocol, just transported over WebSocket instead of USB.
+
+Artisan commands to support (same as current TC4 set):
+
+| Command | WebSocket message | Response |
+|---------|------------------|----------|
+| `READ` | `READ` | `123.4,456.7` (ET,BT) |
+| `OT1,<val>` | `OT1,75` | `#OK` |
+| `OT2,<val>` | `OT2,50` | `#OK` |
+| `DRUM,<val>` | `DRUM,100` | `#OK` |
+| `FILTER,<val>` | `FILTER,1` | `#OK` |
+| `COOL,<val>` | `COOL,100` | `#OK` |
+| `OFF` | `OFF` | `#OK` |
+| `ESTOP` | `ESTOP` | `#OK` |
+
+---
+
 ## Migration Phases
 
-### Phase 1 — WiFi serial bridge (Artisan connection)
+### Phase 1 — WebSocket server (Artisan connection)
 
-**Scope:** Replace USB serial with a TCP server socket. No roaster protocol changes yet.
+**Scope:** Establish the WebSocket link between Artisan and the ESP32. No real roaster protocol yet — use stub temperature values.
 
 **Tasks:**
 1. Create new sketch `SkyCommandESP32/SkyCommandESP32.ino`
 2. Connect ESP32 to WiFi (hardcoded SSID/password initially)
-3. Open a `WiFiServer` on a fixed port (e.g. 23)
-4. Accept a single persistent TCP client
-5. Replace all `Serial.read()` / `Serial.print()` Artisan I/O with reads/writes to the TCP client socket
-6. Verify Artisan connects and the TC4 command/response loop works end-to-end over WiFi
-7. Keep the roaster protocol section as a stub (return dummy temperature values)
+3. Start a `WebSocketsServer` on port 81 using the `arduinoWebSockets` library
+4. Implement a `webSocketEvent()` callback that parses incoming text frames and dispatches commands
+5. On `READ`, respond with stub values (e.g. `"20.0,20.0"`)
+6. On control commands (`OT1`, `OT2`, etc.), store the value and respond `"#OK"`
+7. Configure Artisan's WebSocket device to point at the ESP32 IP and verify the connection
 
-**Artisan configuration change:**  
-In Artisan → Preferences → Device → ET/BT, switch from a serial COM port to a TCP connection (host = ESP32 IP, port = 23).
+**Library:** `arduinoWebSockets` by Markus Sattler — available via Arduino Library Manager as `WebSockets`.
 
-**Success criteria:** Artisan connects over WiFi and receives READ responses with dummy values.
+**Artisan configuration:**  
+Config → Device → set device to **WebSocket** → enter `ws://<esp32-ip>:81` → map ET/BT to the two values in the `READ` response.
+
+**Success criteria:** Artisan connects over WiFi, polls `READ` on schedule, and receives stub temperature values without errors.
 
 ---
 
@@ -119,23 +157,24 @@ This is the most complex phase.
 7. Detect the preamble item (`duration0 > 5000 µs`) to align frame boundaries
 8. Validate checksum; on failure increment `roasterReadAttempts` as before
 9. Feed decoded ADC values A and B into the existing temperature polynomial calculation
+10. Replace the stub `READ` response with real temperature values
 
-**Success criteria:** Live temperature readings from the roaster displayed correctly in Artisan over WiFi.
+**Success criteria:** Live temperature readings from the roaster displayed correctly in Artisan over WebSocket.
 
 ---
 
 ### Phase 4 — Dual-core task split
 
-**Scope:** Move the roaster protocol loop to Core 1 to fully isolate it from WiFi activity.
+**Scope:** Move the roaster protocol loop to Core 1 to fully isolate it from WiFi and WebSocket activity.
 
 **Tasks:**
 1. Extract the roaster read/write loop into a FreeRTOS task function `roasterTask(void* params)`
 2. Pin it to Core 1: `xTaskCreatePinnedToCore(roasterTask, "roaster", 4096, NULL, 2, NULL, 1)`
 3. Share state between cores using a mutex-protected struct (current temps, pending commands)
-4. Keep WiFi, TCP server, and Artisan command handling on Core 0 (the default Arduino loop)
+4. Keep WiFi, WebSocket server, and Artisan command handling on Core 0 (the default Arduino `loop()`)
 5. Validate that the failsafe watchdog (10-second timeout) still functions correctly across cores
 
-**Success criteria:** No timing degradation in roaster communication during active WiFi data transfer.
+**Success criteria:** No timing degradation in roaster communication during active WebSocket data transfer.
 
 ---
 
@@ -161,15 +200,15 @@ This is the most complex phase.
 
 ### Phase 6 — Spy sketch port
 
-**Scope:** Port `SkywalkerSpy` to ESP32 for passive logging over WiFi.
+**Scope:** Port `SkywalkerSpy` to ESP32 for passive logging over WebSocket.
 
 **Tasks:**
 1. Create `SkywalkerSpyESP32/SkywalkerSpyESP32.ino`
 2. Apply the same RMT RX approach from Phase 3 to both controller and roaster Tx lines
-3. Replace blocking `pulseIn()` (currently has no timeout — will deadlock) with RMT capture
-4. Stream output over TCP instead of USB serial
+3. Replace blocking `pulseIn()` (currently has no timeout — will deadlock on ESP32) with RMT capture
+4. Stream `TEMP,HEAT_DUTY,VENT_DUTY` responses over WebSocket instead of USB serial
 
-**Success criteria:** Artisan receives passive temperature + duty cycle log over WiFi.
+**Success criteria:** Artisan receives passive temperature + duty cycle log over WebSocket.
 
 ---
 
@@ -181,8 +220,8 @@ This is the most complex phase.
    - esp32:esp32:esp32
    ```
 2. Add `esp32:esp32` platform to `compile-sketch.yml` alongside `arduino:avr`
-3. Update `CLAUDE.md` with ESP32 sketch locations and RMT conventions
-4. Update `README.md` with new wiring diagram, Artisan TCP config instructions, and provisioning steps
+3. Update `CLAUDE.md` with ESP32 sketch locations, RMT conventions, and WebSocket library dependency
+4. Update `README.md` with new wiring diagram, Artisan WebSocket config instructions, and provisioning steps
 5. Archive (do not delete) the original AVR sketches — keep them working for users without ESP32 hardware
 
 ---
@@ -192,10 +231,11 @@ This is the most complex phase.
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | RMT RX frame alignment issues (missed preamble) | Medium | High | Add idle-gap detection; test with logic analyzer before Artisan integration |
-| WiFi latency causes Artisan timeout | Low | High | Keep TCP keepalive; Artisan timeout is configurable |
+| WebSocket reconnect causes Artisan dropout | Low | Medium | ESP32 WebSocket library handles reconnects; Artisan timeout is configurable |
 | Roaster failsafe triggers during WiFi reconnect | Medium | Medium | Cache last valid command; retransmit on reconnect; Core 1 continues independently |
 | Level shifter introduces signal delay | Low | Medium | Use fast level shifter (TXS0102); validate with logic analyzer |
 | RMT timing drift at temperature | Low | Low | Timing constants have wide margins; monitor in field |
+| Artisan WebSocket message framing mismatch | Low | Medium | Test command/response format against Artisan WebSocket device docs before Phase 3 |
 
 ---
 
@@ -205,7 +245,7 @@ The following are direct ports with no logic changes required:
 
 - Roaster protocol timing constants (preamble, bit durations, inter-bit gap)
 - Temperature polynomial coefficients (16 coefficients, 4th-degree)
-- Artisan TC4 command set (READ, OT1, OT2, DRUM, FILTER, COOL, OFF, ESTOP, CHAN, UNITS)
+- Command set and semantics (READ, OT1, OT2, DRUM, FILTER, COOL, OFF, ESTOP)
 - Checksum validation logic
 - Failsafe timeout (10 seconds)
 - Maximum temperature limit (300°C)
@@ -218,25 +258,23 @@ The following are direct ports with no logic changes required:
 | Library | Purpose | Source |
 |---------|---------|--------|
 | `WiFi.h` | WiFi connection | Arduino-ESP32 built-in |
-| `WiFiServer.h` | TCP server | Arduino-ESP32 built-in |
+| `WebSocketsServer.h` | WebSocket server | [arduinoWebSockets](https://github.com/Links2004/arduinoWebSockets) via Library Manager |
 | `driver/rmt.h` | RMT peripheral (TX + RX) | ESP-IDF / Arduino-ESP32 built-in |
 | `Preferences.h` | NVS credential storage | Arduino-ESP32 built-in |
 | WiFiManager (optional) | Captive portal provisioning | [tzapu/WiFiManager](https://github.com/tzapu/WiFiManager) |
-
-All core dependencies are part of the Arduino-ESP32 board package — no external libraries required unless using WiFiManager.
 
 ---
 
 ## Recommended Development Order
 
 ```
-Phase 1 (TCP bridge)  →  verify Artisan WiFi connection works
-Phase 2 (RMT TX)      →  verify roaster receives correct commands
-Phase 3 (RMT RX)      →  verify temperature reads correctly
-Phase 4 (dual-core)   →  stress test timing under WiFi load
-Phase 5 (provisioning) → quality-of-life, do last
-Phase 6 (Spy port)    → independent, can be done any time after Phase 3
-Phase 7 (CI/CD)       → done alongside each phase
+Phase 1 (WebSocket + Artisan)  →  verify Artisan WiFi connection works
+Phase 2 (RMT TX)               →  verify roaster receives correct commands
+Phase 3 (RMT RX)               →  verify temperature reads correctly
+Phase 4 (dual-core)            →  stress test timing under WiFi load
+Phase 5 (provisioning)         →  quality-of-life, do last
+Phase 6 (Spy port)             →  independent, can be done any time after Phase 3
+Phase 7 (CI/CD)                →  done alongside each phase
 ```
 
 Each phase produces a testable, standalone result. Do not proceed to the next phase until the current one is validated against the real roaster hardware.
