@@ -21,19 +21,36 @@
 //   - Do not remove checksum validation
 //   - Heat/burner (OT1) must be the last output enabled — see Phase 8 pre-conditions
 //
+// Optional probes — uncomment the relevant #define to enable:
+//   #define USE_ET_PROBE      — MAX31855 K-type thermocouple on SPI (GPIO 18/19/15)
+//   #define USE_AMBIENT_PROBE — DS18B20 1-Wire ambient sensor (GPIO 17)
+//
 // Artisan WebSocket config:
 //   URL:  ws://<esp32-ip>:81
-//   READ response format: "ET,BT" (e.g. "0.0,185.4")
+//   READ response format: "ET,BT" (e.g. "185.4,210.2")
+//   With no ET probe:      "0.0,BT"
+//   With no ambient probe: ambient channel not reported
 //
 // License: GPLv3
 // =============================================================================
 
-//#define __DEBUG__   // Verbose RMT decode and command logging
-//#define __WARN__    // Checksum failures and retry warnings
+//#define __DEBUG__         // Verbose RMT decode and command logging
+//#define __WARN__          // Checksum failures and retry warnings
+//#define USE_ET_PROBE      // Enable MAX31855 K-type thermocouple (ET channel)
+//#define USE_AMBIENT_PROBE // Enable DS18B20 ambient temperature sensor
 
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include <driver/rmt.h>
+
+#ifdef USE_ET_PROBE
+#include <Adafruit_MAX31855.h>
+#endif
+
+#ifdef USE_AMBIENT_PROBE
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#endif
 
 // -----------------------------------------------------------------------------
 // WiFi credentials — replace before flashing
@@ -52,6 +69,14 @@ WebSocketsServer webSocket(81);
 // -----------------------------------------------------------------------------
 const gpio_num_t RX_PIN = GPIO_NUM_4;   // Roaster → ESP32 (via 1kΩ/2kΩ divider)
 const gpio_num_t TX_PIN = GPIO_NUM_5;   // ESP32 → Roaster (via 74HCT1G125)
+
+// Optional ET probe — MAX31855 SPI pins
+const int ET_PIN_CLK = 18;
+const int ET_PIN_CS  = 15;
+const int ET_PIN_DO  = 19;
+
+// Optional ambient probe — DS18B20 1-Wire pin
+const int AMBIENT_PIN = 17;
 
 // -----------------------------------------------------------------------------
 // RMT channels
@@ -106,16 +131,30 @@ const int MAX_TEMP_C = 300;   // Emergency stop threshold — do not raise
 const unsigned long ARTISAN_TIMEOUT_US = 10000000UL;   // 10 seconds
 
 // -----------------------------------------------------------------------------
+// Optional probe instances
+// -----------------------------------------------------------------------------
+#ifdef USE_ET_PROBE
+Adafruit_MAX31855 etProbe(ET_PIN_CLK, ET_PIN_CS, ET_PIN_DO);
+#endif
+
+#ifdef USE_AMBIENT_PROBE
+OneWire           oneWire(AMBIENT_PIN);
+DallasTemperature ambientSensor(&oneWire);
+#endif
+
+// -----------------------------------------------------------------------------
 // Shared state between Core 0 (WiFi/WebSocket) and Core 1 (roaster loop)
 // Access must be protected by s_mutex.
 // -----------------------------------------------------------------------------
 typedef struct {
-  double   tempC;                        // Latest temperature reading
+  double   tempC;                        // Latest BT from roaster ADC polynomial
+  double   etC;                          // Latest ET from MAX31855 (or 0.0 if not fitted)
+  double   ambientC;                     // Latest ambient from DS18B20 (or 0.0 if not fitted)
   bool     eStopActive;                  // Latched emergency stop
   unsigned long lastArtisanEventTime;    // micros() of last valid Artisan command
 } SharedState;
 
-static SharedState   s_state  = { 0.0, false, 0 };
+static SharedState   s_state  = { 0.0, 0.0, 0.0, false, 0 };
 static SemaphoreHandle_t s_mutex = NULL;
 
 // -----------------------------------------------------------------------------
@@ -283,6 +322,49 @@ static double calculateTemp() {
 }
 
 // =============================================================================
+// Optional probe reads — called from roasterTask on Core 1
+// Both probes are slow (SPI/1-Wire) and polled at a reduced rate to avoid
+// stalling the roaster loop. Neither blocks the RMT RX path.
+// =============================================================================
+static void readOptionalProbes() {
+#ifdef USE_ET_PROBE
+  double et = etProbe.readCelsius();
+  if (!isnan(et)) {
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      s_state.etC = et;
+      // ET also feeds over-temp safety — if ET exceeds limit, trigger ESTOP
+      if (et > MAX_TEMP_C) {
+        s_state.eStopActive = true;
+        xSemaphoreGive(s_mutex);
+        doEStop();
+        return;
+      }
+      xSemaphoreGive(s_mutex);
+    }
+  } else {
+#ifdef __WARN__
+    Serial.println("[!] ET probe read error (NaN)");
+#endif
+  }
+#endif
+
+#ifdef USE_AMBIENT_PROBE
+  ambientSensor.requestTemperatures();
+  float ambient = ambientSensor.getTempCByIndex(0);
+  if (ambient != DEVICE_DISCONNECTED_C) {
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      s_state.ambientC = ambient;
+      xSemaphoreGive(s_mutex);
+    }
+  } else {
+#ifdef __WARN__
+    Serial.println("[!] Ambient probe disconnected");
+#endif
+  }
+#endif
+}
+
+// =============================================================================
 // Failsafe checks — run on Core 1 every roaster loop iteration
 // =============================================================================
 static void failsafeChecks() {
@@ -358,6 +440,13 @@ static void roasterTask(void* /*params*/) {
 #endif
     }
 
+    // --- Optional probes (polled every ~10 iterations to avoid stalling RMT) ---
+    static int probeCounter = 0;
+    if (++probeCounter >= 10) {
+      probeCounter = 0;
+      readOptionalProbes();
+    }
+
     // --- Failsafe ---
     failsafeChecks();
   }
@@ -387,14 +476,15 @@ static void webSocketEvent(uint8_t num, WStype_t type,
 #endif
 
   if (command == "READ") {
-    double t = 0.0;
+    double bt = 0.0, et = 0.0;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      t = s_state.tempC;
+      bt = s_state.tempC;
+      et = s_state.etC;       // 0.0 if USE_ET_PROBE not defined
       s_state.lastArtisanEventTime = micros();
       xSemaphoreGive(s_mutex);
     }
-    // ET = 0.0 (not wired), BT = roaster temperature
-    String response = "0.0," + String(t, 1);
+    // Artisan expects "ET,BT" — ET is 0.0 when no probe fitted
+    String response = String(et, 1) + "," + String(bt, 1);
     webSocket.sendTXT(num, response);
 
   } else if (command == "CHAN") {
@@ -462,6 +552,21 @@ void setup() {
   s_mutex = xSemaphoreCreateMutex();
   s_state.lastArtisanEventTime = micros();
   doShutdown();
+
+  // Optional probes
+#ifdef USE_ET_PROBE
+  if (!etProbe.begin()) {
+    Serial.println("[!] MAX31855 not found — check wiring (GPIO 18/19/15)");
+  } else {
+    Serial.println("ET probe (MAX31855) ready");
+  }
+#endif
+
+#ifdef USE_AMBIENT_PROBE
+  ambientSensor.begin();
+  Serial.printf("Ambient probe (DS18B20): %d device(s) found on GPIO %d\n",
+                ambientSensor.getDeviceCount(), AMBIENT_PIN);
+#endif
 
   // RMT
   initRmtRx();
