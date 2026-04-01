@@ -43,6 +43,8 @@ The current solution (ELEGOO Nano, ATmega328P) operates at **5V logic**. The ESP
 
 ### Bill of Materials
 
+#### Required
+
 | Qty | Component | Purpose | Notes |
 |-----|-----------|---------|-------|
 | 1 | ESP32-WROOM-32 dev board | Microcontroller | ESP32 DevKitC or equivalent |
@@ -52,9 +54,29 @@ The current solution (ELEGOO Nano, ATmega328P) operates at **5V logic**. The ESP
 | 1 | 100 nF ceramic capacitor | Bypass cap for 74HCT VCC | Place close to IC pins |
 | — | Hookup wire / breadboard | Connections | |
 
+#### Optional — ET probe (exhaust temperature, K-type thermocouple)
+
+Provides an independent ET channel in Artisan and a redundant over-temperature safety path that does not rely on the roaster's internal ADC or the polynomial model.
+
+| Qty | Component | Purpose | Notes |
+|-----|-----------|---------|-------|
+| 1 | MAX31855 breakout board | K-type thermocouple amplifier + cold junction compensation | Adafruit #269 or equivalent; 3.3V native — no level shifter needed |
+| 1 | K-type thermocouple probe | Exhaust / ET temperature sensing | Choose probe length/type to suit roaster exhaust port |
+
+#### Optional — ambient probe
+
+Provides room/ambient temperature as an additional Artisan channel. Useful for environment logging and charge temperature reference.
+
+| Qty | Component | Purpose | Notes |
+|-----|-----------|---------|-------|
+| 1 | DS18B20 (TO-92 or waterproof probe) | 1-Wire digital temperature sensor | 3.3V compatible; ±0.5°C accuracy |
+| 1 | 4.7 kΩ resistor (1/4W) | 1-Wire pull-up to 3.3V | Required by 1-Wire protocol |
+
 **Why these components:**
 - **74HCT1G125** — HCT-family logic accepts 3.3V as a valid HIGH (V_IH min = 2.0V) and outputs at VCC (5V). Non-inverting with active-low output enable tied to GND. Cleanest solution for boosting the TX line.
-- **Resistor divider (1kΩ + 2kΩ)** — Passively divides 5V to 3.33V on the RX line. No active components needed for a signal going *into* the ESP32. The signal source impedance of the roaster is low, so divider loading is not a concern.
+- **Resistor divider (1kΩ + 2kΩ)** — Passively divides 5V to 3.33V on the RX line. No active components needed for a signal going *into* the ESP32.
+- **MAX31855** — SPI interface, built-in cold junction compensation, 14-bit resolution, 3.3V native. No level shifter required.
+- **DS18B20** — 1-Wire protocol, single GPIO + pull-up resistor. Multiple sensors can share one pin if needed.
 
 ### Wiring diagram
 
@@ -68,13 +90,13 @@ ROASTER USB CABLE
   Black ─────────────────────── GND ─────┬── ESP32 GND
                                          └── 74HCT1G125 GND (pin 2)
 
-  Green (Roaster → Arduino rxPin)
+  Green (Roaster → ESP32 RX)
     ├── R1 (1kΩ) ──┬── R2 (2kΩ) ── GND
                    └──────────────────── ESP32 GPIO 4 (RX, 3.3V input)
 
     [5V signal divided to 3.33V before reaching ESP32]
 
-  White (Arduino txPin → Roaster)
+  White (ESP32 TX → Roaster)
     └── 74HCT1G125 output (pin 4) ──────── White wire onward to roaster
 
          74HCT1G125 (SOT-23-5)
@@ -85,18 +107,48 @@ ROASTER USB CABLE
          │ VCC (5) ├── 5V rail
          │ GND (1) ├── GND
          └─────────┘
+
+
+OPTIONAL — ET probe (MAX31855 + K-type thermocouple)
+─────────────────────────────────────────────────────────────
+
+  ESP32 3.3V ──── MAX31855 VCC
+  ESP32 GND  ──── MAX31855 GND
+  ESP32 GPIO 18 ── MAX31855 CLK   (SPI clock, shared if adding more SPI devices)
+  ESP32 GPIO 19 ── MAX31855 DO    (MISO — read only, no MOSI connection needed)
+  ESP32 GPIO 15 ── MAX31855 CS    (chip select)
+
+  MAX31855 T+ / T- ──── K-type thermocouple leads (polarity marked on board)
+
+  [All signals 3.3V — no level shifter required]
+
+
+OPTIONAL — Ambient probe (DS18B20)
+─────────────────────────────────────────────────────────────
+
+  ESP32 3.3V ──┬── 4.7kΩ pull-up ──┬── ESP32 GPIO 17 (1-Wire data)
+               │                   └── DS18B20 DATA pin
+               └── DS18B20 VCC
+
+  ESP32 GND  ──── DS18B20 GND
+
+  [3.3V native — no level shifter required]
 ```
 
 ### Wiring table
 
-| Signal | Arduino pin | ESP32 GPIO | Level shifting |
-|--------|-------------|------------|----------------|
-| Roaster RX / read (Green wire) | Digital 2 | GPIO 4 | 5V → 3.3V via 1kΩ + 2kΩ divider |
-| Roaster TX / write (White wire) | Digital 3 | GPIO 5 | 3.3V → 5V via 74HCT1G125 |
-| Power (Red wire) | VIN | VIN | Direct — also powers 74HCT1G125 |
-| Ground (Black wire) | GND | GND | Common ground |
+| Signal | ESP32 GPIO | Interface | Notes |
+|--------|------------|-----------|-------|
+| Roaster RX / read (Green wire) | GPIO 4 | RMT RX | 5V → 3.3V via 1kΩ + 2kΩ divider |
+| Roaster TX / write (White wire) | GPIO 5 | RMT TX | 3.3V → 5V via 74HCT1G125 |
+| Power (Red wire) | VIN | — | Direct; also powers 74HCT1G125 |
+| Ground (Black wire) | GND | — | Common ground |
+| MAX31855 CLK *(optional)* | GPIO 18 | SPI | ET probe clock |
+| MAX31855 DO *(optional)* | GPIO 19 | SPI MISO | ET probe data |
+| MAX31855 CS *(optional)* | GPIO 15 | SPI CS | ET probe chip select |
+| DS18B20 DATA *(optional)* | GPIO 17 | 1-Wire | Ambient probe; 4.7kΩ pull-up to 3.3V |
 
-GPIO numbers are suggestions — any available GPIO works with RMT.
+GPIO numbers are suggestions — any available GPIO works for each function.
 
 ---
 
@@ -369,7 +421,9 @@ The following are direct ports with no logic changes required:
 | `WebSocketsServer.h` | WebSocket server | [arduinoWebSockets](https://github.com/Links2004/arduinoWebSockets) via Library Manager |
 | `driver/rmt.h` | RMT peripheral (TX + RX) | ESP-IDF / Arduino-ESP32 built-in |
 | `Preferences.h` | NVS credential storage | Arduino-ESP32 built-in |
-| WiFiManager (optional) | Captive portal provisioning | [tzapu/WiFiManager](https://github.com/tzapu/WiFiManager) |
+| `Adafruit_MAX31855.h` *(optional)* | ET probe — K-type thermocouple via MAX31855 | [Adafruit MAX31855](https://github.com/adafruit/Adafruit-MAX31855-library) via Library Manager |
+| `DallasTemperature.h` + `OneWire.h` *(optional)* | Ambient probe — DS18B20 | [DallasTemperature](https://github.com/milesburton/Arduino-Temperature-Control-Library) + [OneWire](https://github.com/PaulStoffregen/OneWire) via Library Manager |
+| WiFiManager *(optional)* | Captive portal provisioning | [tzapu/WiFiManager](https://github.com/tzapu/WiFiManager) |
 
 ---
 
