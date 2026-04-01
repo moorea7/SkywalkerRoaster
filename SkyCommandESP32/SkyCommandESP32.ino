@@ -21,9 +21,11 @@
 //   - Do not remove checksum validation
 //   - Heat/burner (OT1) must be the last output enabled — see Phase 8 pre-conditions
 //
-// Optional probes — uncomment the relevant #define to enable:
-//   #define USE_ET_PROBE      — MAX31855 K-type thermocouple on SPI (GPIO 18/19/15)
-//   #define USE_AMBIENT_PROBE — DS18B20 1-Wire ambient sensor (GPIO 17)
+// Optional probes — both use identical MAX31855 + K-type thermocouple circuits.
+// Shared SPI bus (CLK + MISO), separate CS pins per probe.
+// Uncomment to enable:
+//   #define USE_ET_PROBE      — MAX31855 on GPIO 18/19/15 (ET channel)
+//   #define USE_AMBIENT_PROBE — MAX31855 on GPIO 18/19/14 (ambient channel)
 //
 // Artisan WebSocket config:
 //   URL:  ws://<esp32-ip>:81
@@ -37,19 +39,14 @@
 //#define __DEBUG__         // Verbose RMT decode and command logging
 //#define __WARN__          // Checksum failures and retry warnings
 //#define USE_ET_PROBE      // Enable MAX31855 K-type thermocouple (ET channel)
-//#define USE_AMBIENT_PROBE // Enable DS18B20 ambient temperature sensor
+//#define USE_AMBIENT_PROBE // Enable MAX31855 K-type thermocouple (ambient channel)
 
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include <driver/rmt.h>
 
-#ifdef USE_ET_PROBE
+#if defined(USE_ET_PROBE) || defined(USE_AMBIENT_PROBE)
 #include <Adafruit_MAX31855.h>
-#endif
-
-#ifdef USE_AMBIENT_PROBE
-#include <OneWire.h>
-#include <DallasTemperature.h>
 #endif
 
 // -----------------------------------------------------------------------------
@@ -70,13 +67,11 @@ WebSocketsServer webSocket(81);
 const gpio_num_t RX_PIN = GPIO_NUM_4;   // Roaster → ESP32 (via 1kΩ/2kΩ divider)
 const gpio_num_t TX_PIN = GPIO_NUM_5;   // ESP32 → Roaster (via 74HCT1G125)
 
-// Optional ET probe — MAX31855 SPI pins
-const int ET_PIN_CLK = 18;
-const int ET_PIN_CS  = 15;
-const int ET_PIN_DO  = 19;
-
-// Optional ambient probe — DS18B20 1-Wire pin
-const int AMBIENT_PIN = 17;
+// Optional probes — shared SPI bus, separate CS pins
+const int PROBE_PIN_CLK = 18;   // Shared SPI clock
+const int PROBE_PIN_DO  = 19;   // Shared SPI MISO
+const int ET_PIN_CS     = 15;   // ET probe chip select
+const int AMBIENT_PIN_CS = 14;  // Ambient probe chip select
 
 // -----------------------------------------------------------------------------
 // RMT channels
@@ -131,15 +126,14 @@ const int MAX_TEMP_C = 300;   // Emergency stop threshold — do not raise
 const unsigned long ARTISAN_TIMEOUT_US = 10000000UL;   // 10 seconds
 
 // -----------------------------------------------------------------------------
-// Optional probe instances
+// Optional probe instances — identical circuit, separate CS pins
 // -----------------------------------------------------------------------------
 #ifdef USE_ET_PROBE
-Adafruit_MAX31855 etProbe(ET_PIN_CLK, ET_PIN_CS, ET_PIN_DO);
+Adafruit_MAX31855 etProbe(PROBE_PIN_CLK, ET_PIN_CS, PROBE_PIN_DO);
 #endif
 
 #ifdef USE_AMBIENT_PROBE
-OneWire           oneWire(AMBIENT_PIN);
-DallasTemperature ambientSensor(&oneWire);
+Adafruit_MAX31855 ambientProbe(PROBE_PIN_CLK, AMBIENT_PIN_CS, PROBE_PIN_DO);
 #endif
 
 // -----------------------------------------------------------------------------
@@ -149,7 +143,7 @@ DallasTemperature ambientSensor(&oneWire);
 typedef struct {
   double   tempC;                        // Latest BT from roaster ADC polynomial
   double   etC;                          // Latest ET from MAX31855 (or 0.0 if not fitted)
-  double   ambientC;                     // Latest ambient from DS18B20 (or 0.0 if not fitted)
+  double   ambientC;                     // Latest ambient from MAX31855 (or 0.0 if not fitted)
   bool     eStopActive;                  // Latched emergency stop
   unsigned long lastArtisanEventTime;    // micros() of last valid Artisan command
 } SharedState;
@@ -349,16 +343,15 @@ static void readOptionalProbes() {
 #endif
 
 #ifdef USE_AMBIENT_PROBE
-  ambientSensor.requestTemperatures();
-  float ambient = ambientSensor.getTempCByIndex(0);
-  if (ambient != DEVICE_DISCONNECTED_C) {
+  double ambient = ambientProbe.readCelsius();
+  if (!isnan(ambient)) {
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       s_state.ambientC = ambient;
       xSemaphoreGive(s_mutex);
     }
   } else {
 #ifdef __WARN__
-    Serial.println("[!] Ambient probe disconnected");
+    Serial.println("[!] Ambient probe read error (NaN)");
 #endif
   }
 #endif
@@ -553,19 +546,21 @@ void setup() {
   s_state.lastArtisanEventTime = micros();
   doShutdown();
 
-  // Optional probes
+  // Optional probes — both MAX31855, shared SPI bus
 #ifdef USE_ET_PROBE
   if (!etProbe.begin()) {
-    Serial.println("[!] MAX31855 not found — check wiring (GPIO 18/19/15)");
+    Serial.println("[!] ET probe (MAX31855) not found — check wiring (CLK:18 DO:19 CS:15)");
   } else {
     Serial.println("ET probe (MAX31855) ready");
   }
 #endif
 
 #ifdef USE_AMBIENT_PROBE
-  ambientSensor.begin();
-  Serial.printf("Ambient probe (DS18B20): %d device(s) found on GPIO %d\n",
-                ambientSensor.getDeviceCount(), AMBIENT_PIN);
+  if (!ambientProbe.begin()) {
+    Serial.println("[!] Ambient probe (MAX31855) not found — check wiring (CLK:18 DO:19 CS:14)");
+  } else {
+    Serial.println("Ambient probe (MAX31855) ready");
+  }
 #endif
 
   // RMT
