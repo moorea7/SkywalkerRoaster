@@ -54,29 +54,21 @@ The current solution (ELEGOO Nano, ATmega328P) operates at **5V logic**. The ESP
 | 1 | 100 nF ceramic capacitor | Bypass cap for 74HCT VCC | Place close to IC pins |
 | — | Hookup wire / breadboard | Connections | |
 
-#### Optional — ET probe (exhaust temperature, K-type thermocouple)
+#### Optional — ET probe and ambient probe (K-type thermocouple × 2)
 
-Provides an independent ET channel in Artisan and a redundant over-temperature safety path that does not rely on the roaster's internal ADC or the polynomial model.
+Both probes use **identical circuits** — MAX31855 breakout + K-type thermocouple. They share the same SPI bus (CLK and MISO), with a separate CS pin per board. One K-type probe is placed at the roaster exhaust (ET), the other for ambient/room temperature.
 
-| Qty | Component | Purpose | Notes |
-|-----|-----------|---------|-------|
-| 1 | MAX31855 breakout board | K-type thermocouple amplifier + cold junction compensation | Adafruit #269 or equivalent; 3.3V native — no level shifter needed |
-| 1 | K-type thermocouple probe | Exhaust / ET temperature sensing | Choose probe length/type to suit roaster exhaust port |
-
-#### Optional — ambient probe
-
-Provides room/ambient temperature as an additional Artisan channel. Useful for environment logging and charge temperature reference.
+Using identical circuits means identical wiring, identical code pattern, and a single library. K-type thermocouples cover −200°C to +1350°C, which suits both the exhaust port and room temperature equally well.
 
 | Qty | Component | Purpose | Notes |
 |-----|-----------|---------|-------|
-| 1 | DS18B20 (TO-92 or waterproof probe) | 1-Wire digital temperature sensor | 3.3V compatible; ±0.5°C accuracy |
-| 1 | 4.7 kΩ resistor (1/4W) | 1-Wire pull-up to 3.3V | Required by 1-Wire protocol |
+| 2 | MAX31855 breakout board | K-type thermocouple amplifier + cold junction compensation | Adafruit #269 or equivalent; 3.3V native — no level shifter needed |
+| 2 | K-type thermocouple probe | ET (exhaust) and ambient temperature sensing | Choose probe length/style to suit placement |
 
 **Why these components:**
 - **74HCT1G125** — HCT-family logic accepts 3.3V as a valid HIGH (V_IH min = 2.0V) and outputs at VCC (5V). Non-inverting with active-low output enable tied to GND. Cleanest solution for boosting the TX line.
 - **Resistor divider (1kΩ + 2kΩ)** — Passively divides 5V to 3.33V on the RX line. No active components needed for a signal going *into* the ESP32.
-- **MAX31855** — SPI interface, built-in cold junction compensation, 14-bit resolution, 3.3V native. No level shifter required.
-- **DS18B20** — 1-Wire protocol, single GPIO + pull-up resistor. Multiple sensors can share one pin if needed.
+- **MAX31855 × 2** — SPI interface, built-in cold junction compensation, 14-bit resolution, 3.3V native. Shared SPI bus; no level shifters required for either probe.
 
 ### Wiring diagram
 
@@ -109,30 +101,28 @@ ROASTER USB CABLE
          └─────────┘
 
 
-OPTIONAL — ET probe (MAX31855 + K-type thermocouple)
+OPTIONAL — ET probe + Ambient probe (identical MAX31855 circuits, shared SPI)
 ─────────────────────────────────────────────────────────────
 
-  ESP32 3.3V ──── MAX31855 VCC
-  ESP32 GND  ──── MAX31855 GND
-  ESP32 GPIO 18 ── MAX31855 CLK   (SPI clock, shared if adding more SPI devices)
-  ESP32 GPIO 19 ── MAX31855 DO    (MISO — read only, no MOSI connection needed)
-  ESP32 GPIO 15 ── MAX31855 CS    (chip select)
+  ESP32 3.3V ──┬── MAX31855 #1 (ET)      VCC
+               └── MAX31855 #2 (Ambient) VCC
 
-  MAX31855 T+ / T- ──── K-type thermocouple leads (polarity marked on board)
+  ESP32 GND  ──┬── MAX31855 #1 (ET)      GND
+               └── MAX31855 #2 (Ambient) GND
 
-  [All signals 3.3V — no level shifter required]
+  ESP32 GPIO 18 ──┬── MAX31855 #1 (ET)      CLK   (shared SPI clock)
+                  └── MAX31855 #2 (Ambient) CLK
 
+  ESP32 GPIO 19 ──┬── MAX31855 #1 (ET)      DO    (shared SPI MISO)
+                  └── MAX31855 #2 (Ambient) DO
 
-OPTIONAL — Ambient probe (DS18B20)
-─────────────────────────────────────────────────────────────
+  ESP32 GPIO 15 ──── MAX31855 #1 (ET)      CS    (individual chip select)
+  ESP32 GPIO 14 ──── MAX31855 #2 (Ambient) CS    (individual chip select)
 
-  ESP32 3.3V ──┬── 4.7kΩ pull-up ──┬── ESP32 GPIO 17 (1-Wire data)
-               │                   └── DS18B20 DATA pin
-               └── DS18B20 VCC
+  MAX31855 #1 T+/T- ──── K-type probe at roaster exhaust
+  MAX31855 #2 T+/T- ──── K-type probe at ambient location
 
-  ESP32 GND  ──── DS18B20 GND
-
-  [3.3V native — no level shifter required]
+  [All signals 3.3V — no level shifter required for either probe]
 ```
 
 ### Wiring table
@@ -143,10 +133,10 @@ OPTIONAL — Ambient probe (DS18B20)
 | Roaster TX / write (White wire) | GPIO 5 | RMT TX | 3.3V → 5V via 74HCT1G125 |
 | Power (Red wire) | VIN | — | Direct; also powers 74HCT1G125 |
 | Ground (Black wire) | GND | — | Common ground |
-| MAX31855 CLK *(optional)* | GPIO 18 | SPI | ET probe clock |
-| MAX31855 DO *(optional)* | GPIO 19 | SPI MISO | ET probe data |
-| MAX31855 CS *(optional)* | GPIO 15 | SPI CS | ET probe chip select |
-| DS18B20 DATA *(optional)* | GPIO 17 | 1-Wire | Ambient probe; 4.7kΩ pull-up to 3.3V |
+| SPI CLK — both probes *(optional)* | GPIO 18 | SPI | Shared between ET and ambient MAX31855 |
+| SPI MISO — both probes *(optional)* | GPIO 19 | SPI MISO | Shared between ET and ambient MAX31855 |
+| MAX31855 #1 CS — ET *(optional)* | GPIO 15 | SPI CS | ET probe chip select |
+| MAX31855 #2 CS — Ambient *(optional)* | GPIO 14 | SPI CS | Ambient probe chip select |
 
 GPIO numbers are suggestions — any available GPIO works for each function.
 
@@ -421,8 +411,7 @@ The following are direct ports with no logic changes required:
 | `WebSocketsServer.h` | WebSocket server | [arduinoWebSockets](https://github.com/Links2004/arduinoWebSockets) via Library Manager |
 | `driver/rmt.h` | RMT peripheral (TX + RX) | ESP-IDF / Arduino-ESP32 built-in |
 | `Preferences.h` | NVS credential storage | Arduino-ESP32 built-in |
-| `Adafruit_MAX31855.h` *(optional)* | ET probe — K-type thermocouple via MAX31855 | [Adafruit MAX31855](https://github.com/adafruit/Adafruit-MAX31855-library) via Library Manager |
-| `DallasTemperature.h` + `OneWire.h` *(optional)* | Ambient probe — DS18B20 | [DallasTemperature](https://github.com/milesburton/Arduino-Temperature-Control-Library) + [OneWire](https://github.com/PaulStoffregen/OneWire) via Library Manager |
+| `Adafruit_MAX31855.h` *(optional)* | ET and ambient probes — both K-type thermocouple via MAX31855 | [Adafruit MAX31855](https://github.com/adafruit/Adafruit-MAX31855-library) via Library Manager |
 | WiFiManager *(optional)* | Captive portal provisioning | [tzapu/WiFiManager](https://github.com/tzapu/WiFiManager) |
 
 ---
